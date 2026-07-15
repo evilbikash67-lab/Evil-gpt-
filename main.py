@@ -23,25 +23,34 @@ import io
 from functools import lru_cache, wraps
 import random
 
-# Third-party imports
+# Aiogram 3.17+ imports - FIXED
 from aiogram import Bot, Dispatcher, types, F, Router
 from aiogram.types import (
-    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
-    ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove,
-    InputFile, BufferedInputFile, FSInputFile, Update,
-    ChatType
+    Message,
+    CallbackQuery,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardRemove,
+    InputFile,
+    BufferedInputFile,
+    FSInputFile,
+    Update,
 )
 from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.enums import ParseMode, ChatAction
+from aiogram.enums import ParseMode, ChatAction, ChatType
 from aiogram.exceptions import (
-    TelegramBadRequest, TelegramRetryAfter,
-    TelegramNetworkError, TelegramAPIError
+    TelegramBadRequest,
+    TelegramRetryAfter,
+    TelegramNetworkError,
+    TelegramAPIError
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram.client.bot import DefaultBotProperties
+from aiogram.client.default import DefaultBotProperties
 
 # Web framework for webhooks and health checks
 from fastapi import FastAPI, Request, Response
