@@ -29,13 +29,13 @@ from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
     ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove,
     InputFile, BufferedInputFile, FSInputFile, Update,
-    ChatAction, ChatType
+    ChatType
 )
 from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.enums import ParseMode
+from aiogram.enums import ParseMode, ChatAction
 from aiogram.exceptions import (
     TelegramBadRequest, TelegramRetryAfter,
     TelegramNetworkError, TelegramAPIError
