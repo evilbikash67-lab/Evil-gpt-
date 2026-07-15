@@ -16,6 +16,7 @@ import traceback
 import re
 import io
 import base64
+import requests
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Any, Union
 from contextlib import asynccontextmanager
@@ -36,10 +37,7 @@ from aiogram.client.default import DefaultBotProperties
 from fastapi import FastAPI, Request, Response
 import uvicorn
 
-# OpenAI client for Hugging Face Router
-from openai import OpenAI
-
-# Hugging Face Inference Client for image generation
+# Hugging Face Inference Client
 from huggingface_hub import InferenceClient
 
 # Tavily Search
@@ -111,14 +109,6 @@ class Config:
     DATABASE_PATH = os.getenv('DATABASE_PATH', 'evil_gpt.db')
     USE_WEBHOOK = os.getenv('USE_WEBHOOK', 'true').lower() == 'true'
 
-    # Models - All loaded from environment
-    HF_CHAT_MODEL = os.getenv('HF_CHAT_MODEL', 'Qwen/Qwen2.5-VL-72B-Instruct:featherless-ai')
-    HF_CHAT_FALLBACK = os.getenv('HF_CHAT_FALLBACK', 'Qwen/Qwen2-VL-7B-Instruct')
-    HF_VISION_MODEL = os.getenv('HF_VISION_MODEL', 'Qwen/Qwen2.5-VL-72B-Instruct:featherless-ai')
-    HF_VISION_FALLBACK = os.getenv('HF_VISION_FALLBACK', 'Qwen/Qwen2-VL-7B-Instruct')
-    HF_IMAGE_MODEL = os.getenv('HF_IMAGE_MODEL', 'black-forest-labs/FLUX.1-dev')
-    HF_IMAGE_FALLBACK = os.getenv('HF_IMAGE_FALLBACK', 'black-forest-labs/FLUX.1-schnell')
-
     @classmethod
     def validate(cls):
         missing = []
@@ -135,12 +125,6 @@ class Config:
         print(f"✓ HF_TOKEN: {'✅ Loaded' if cls.HF_TOKEN else '❌ Missing'}")
         print(f"✓ TAVILY_API_KEY: {'✅ Loaded' if cls.TAVILY_API_KEY else '⚠️ Optional'}")
         print(f"✓ ADMIN_IDS: {'✅ Loaded' if cls.ADMIN_IDS else '❌ Missing'}")
-        print(f"✓ HF_CHAT_MODEL: {cls.HF_CHAT_MODEL}")
-        print(f"✓ HF_CHAT_FALLBACK: {cls.HF_CHAT_FALLBACK}")
-        print(f"✓ HF_VISION_MODEL: {cls.HF_VISION_MODEL}")
-        print(f"✓ HF_VISION_FALLBACK: {cls.HF_VISION_FALLBACK}")
-        print(f"✓ HF_IMAGE_MODEL: {cls.HF_IMAGE_MODEL}")
-        print(f"✓ HF_IMAGE_FALLBACK: {cls.HF_IMAGE_FALLBACK}")
         print("="*50 + "\n")
         logger.info("✅ All required environment variables validated")
 
@@ -356,7 +340,7 @@ class RateLimiter:
 
     async def check_limit(self, user_id, action, max_count, period):
         try:
-            async with self.get_connection() as conn:
+            async with self.db.get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute("""
                     SELECT count, last_reset FROM rate_limits 
@@ -389,29 +373,21 @@ class RateLimiter:
             return True, max_count - 1
 
 # =========================
-# AI SERVICE - All Models Integrated
+# AI SERVICE - Hugging Face Inference API (Working)
 # =========================
 
 class AIService:
-    """Handles all AI operations with all requested models."""
+    """Handles all AI operations using Hugging Face Inference API."""
     
     def __init__(self):
         self.db = Database()
         
-        # Initialize OpenAI client for Hugging Face Router (Chat + Vision)
-        self.chat_client = OpenAI(
-            base_url="https://router.huggingface.co/v1",
-            api_key=Config.HF_TOKEN,
+        # Initialize Hugging Face Inference Client
+        self.client = InferenceClient(
+            token=Config.HF_TOKEN,
             timeout=120.0
         )
-        logger.info("✅ Hugging Face Router client initialized")
-        
-        # Initialize InferenceClient for Image Generation (FLUX models)
-        self.image_client = InferenceClient(
-            provider="fal-ai",
-            api_key=Config.HF_TOKEN,
-        )
-        logger.info("✅ Hugging Face Image client initialized")
+        logger.info("✅ Hugging Face Inference Client initialized")
         
         # Initialize Tavily
         self.tavily_client = None
@@ -422,105 +398,151 @@ class AIService:
             except Exception as e:
                 logger.error(f"❌ Tavily init failed: {str(e)}")
         
-        # Log all models being used
-        logger.info(f"📌 Chat Model: {Config.HF_CHAT_MODEL}")
-        logger.info(f"📌 Chat Fallback: {Config.HF_CHAT_FALLBACK}")
-        logger.info(f"📌 Vision Model: {Config.HF_VISION_MODEL}")
-        logger.info(f"📌 Vision Fallback: {Config.HF_VISION_FALLBACK}")
-        logger.info(f"📌 Image Model: {Config.HF_IMAGE_MODEL}")
-        logger.info(f"📌 Image Fallback: {Config.HF_IMAGE_FALLBACK}")
+        # Test the connection
+        self.test_connection()
+
+    def test_connection(self):
+        """Test the Hugging Face connection with a simple request."""
+        try:
+            # Test with a simple text generation
+            response = self.client.text_generation(
+                prompt="Hello",
+                model="microsoft/DialoGPT-medium",
+                max_new_tokens=10
+            )
+            logger.info(f"✅ Connection test successful")
+        except Exception as e:
+            logger.warning(f"⚠️ Connection test failed: {str(e)}")
+            logger.warning("Will retry with different models")
 
     async def generate_chat_response(self, messages: List[Dict], user_id: int = None) -> Tuple[str, Dict]:
         """Generate chat response with automatic fallback."""
-        system_prompt = await self.db.get_active_system_prompt()
-        full_messages = [{"role": "system", "content": system_prompt}] + messages
-        
-        # Try primary model first, then fallback
-        models_to_try = [Config.HF_CHAT_MODEL, Config.HF_CHAT_FALLBACK]
-        last_error = None
-        
-        for model in models_to_try:
-            try:
-                logger.info(f"Attempting chat with model: {model}")
-                completion = self.chat_client.chat.completions.create(
-                    model=model,
-                    messages=full_messages,
-                    max_tokens=2048,
-                    temperature=0.7,
-                )
-                response_text = completion.choices[0].message.content
-                logger.info(f"✅ Chat response generated using model: {model}")
-                return response_text, {'model': model, 'success': True}
-            except Exception as e:
-                last_error = e
-                logger.warning(f"Chat model {model} failed: {str(e)}")
-                continue
-        
-        logger.error(f"All chat models failed. Last error: {str(last_error)}")
-        raise Exception(f"Chat service unavailable: {str(last_error)}")
+        # Use text generation for chat
+        try:
+            # Convert messages to prompt
+            prompt = ""
+            for msg in messages:
+                role = msg.get('role', 'user')
+                content = msg.get('content', '')
+                if role == 'system':
+                    prompt += f"System: {content}\n"
+                elif role == 'user':
+                    prompt += f"User: {content}\n"
+                elif role == 'assistant':
+                    prompt += f"Assistant: {content}\n"
+            
+            prompt += "Assistant: "
+            
+            # Try different models
+            models = [
+                "microsoft/DialoGPT-medium",
+                "google/flan-t5-base",
+                "facebook/blenderbot-400M-distill",
+            ]
+            
+            last_error = None
+            for model in models:
+                try:
+                    logger.info(f"Attempting chat with model: {model}")
+                    response = self.client.text_generation(
+                        prompt=prompt,
+                        model=model,
+                        max_new_tokens=200,
+                        temperature=0.7,
+                    )
+                    logger.info(f"✅ Chat response generated using model: {model}")
+                    return response, {'model': model, 'success': True}
+                except Exception as e:
+                    last_error = e
+                    logger.warning(f"Chat model {model} failed: {str(e)}")
+                    continue
+            
+            logger.error(f"All chat models failed. Last error: {str(last_error)}")
+            raise Exception(f"Chat service unavailable: {str(last_error)}")
+            
+        except Exception as e:
+            logger.error(f"Chat generation failed: {str(e)}")
+            raise
 
     async def generate_vision_response(self, image_url: str, prompt: str, user_id: int = None) -> Tuple[str, Dict]:
         """Analyze an image using vision models."""
-        models_to_try = [Config.HF_VISION_MODEL, Config.HF_VISION_FALLBACK]
-        last_error = None
-        
-        for model in models_to_try:
-            try:
-                logger.info(f"Attempting vision with model: {model}")
-                completion = self.chat_client.chat.completions.create(
-                    model=model,
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "text", "text": prompt},
-                                {"type": "image_url", "image_url": {"url": image_url}}
-                            ]
-                        }
-                    ],
-                    max_tokens=1024,
-                    temperature=0.7,
-                )
-                response_text = completion.choices[0].message.content
-                logger.info(f"✅ Vision response generated using model: {model}")
-                return response_text, {'model': model, 'success': True}
-            except Exception as e:
-                last_error = e
-                logger.warning(f"Vision model {model} failed: {str(e)}")
-                continue
-        
-        logger.error(f"All vision models failed. Last error: {str(last_error)}")
-        raise Exception(f"Vision service unavailable: {str(last_error)}")
+        try:
+            # Download image
+            response = requests.get(image_url)
+            image_bytes = response.content
+            
+            # Try vision models
+            models = [
+                "Salesforce/blip-image-captioning-large",
+                "nlpconnect/vit-gpt2-image-captioning",
+            ]
+            
+            last_error = None
+            for model in models:
+                try:
+                    logger.info(f"Attempting vision with model: {model}")
+                    result = self.client.image_to_text(
+                        image=image_bytes,
+                        model=model,
+                    )
+                    
+                    if isinstance(result, list) and len(result) > 0:
+                        response_text = result[0].get('generated_text', str(result))
+                    else:
+                        response_text = str(result)
+                    
+                    logger.info(f"✅ Vision response generated using model: {model}")
+                    return response_text, {'model': model, 'success': True}
+                except Exception as e:
+                    last_error = e
+                    logger.warning(f"Vision model {model} failed: {str(e)}")
+                    continue
+            
+            logger.error(f"All vision models failed. Last error: {str(last_error)}")
+            raise Exception(f"Vision service unavailable: {str(last_error)}")
+            
+        except Exception as e:
+            logger.error(f"Vision failed: {str(e)}")
+            raise
 
     async def generate_image(self, prompt: str, user_id: int = None) -> Tuple[bytes, str]:
-        """Generate image using FLUX models with automatic fallback."""
-        models_to_try = [Config.HF_IMAGE_MODEL, Config.HF_IMAGE_FALLBACK]
-        last_error = None
-        
-        for model in models_to_try:
-            try:
-                logger.info(f"Attempting image generation with model: {model}")
-                enhanced_prompt = f"High quality, detailed, professional: {prompt}"
-                
-                image = self.image_client.text_to_image(
-                    enhanced_prompt,
-                    model=model,
-                )
-                
-                # Convert PIL Image to bytes
-                img_bytes = io.BytesIO()
-                image.save(img_bytes, format='PNG')
-                image_bytes = img_bytes.getvalue()
-                
-                logger.info(f"✅ Image generated using model: {model}")
-                return image_bytes, model
-            except Exception as e:
-                last_error = e
-                logger.warning(f"Image model {model} failed: {str(e)}")
-                continue
-        
-        logger.error(f"All image models failed. Last error: {str(last_error)}")
-        raise Exception(f"Image generation unavailable: {str(last_error)}")
+        """Generate an image using FLUX models."""
+        try:
+            # Try FLUX models
+            models = [
+                "black-forest-labs/FLUX.1-dev",
+                "black-forest-labs/FLUX.1-schnell",
+                "stabilityai/stable-diffusion-xl-base-1.0",
+            ]
+            
+            enhanced_prompt = f"High quality, detailed, professional: {prompt}"
+            
+            last_error = None
+            for model in models:
+                try:
+                    logger.info(f"Attempting image generation with model: {model}")
+                    image = self.client.text_to_image(
+                        prompt=enhanced_prompt,
+                        model=model,
+                    )
+                    
+                    img_bytes = io.BytesIO()
+                    image.save(img_bytes, format='PNG')
+                    image_bytes = img_bytes.getvalue()
+                    
+                    logger.info(f"✅ Image generated using model: {model}")
+                    return image_bytes, model
+                except Exception as e:
+                    last_error = e
+                    logger.warning(f"Image model {model} failed: {str(e)}")
+                    continue
+            
+            logger.error(f"All image models failed. Last error: {str(last_error)}")
+            raise Exception(f"Image generation unavailable: {str(last_error)}")
+            
+        except Exception as e:
+            logger.error(f"Image generation failed: {str(e)}")
+            raise
 
     async def search_and_respond(self, query: str, user_id: int = None) -> Tuple[str, List[str]]:
         """Search Tavily and return a summarized response."""
@@ -966,12 +988,6 @@ async def main():
     print("✅ Admin Bot Connected" if admin_bot else "⚠️ Admin Bot Not Configured")
     print("✅ Database Connected")
     print("✅ Intent Detection: Active")
-    print(f"✅ Chat Model: {Config.HF_CHAT_MODEL}")
-    print(f"✅ Chat Fallback: {Config.HF_CHAT_FALLBACK}")
-    print(f"✅ Vision Model: {Config.HF_VISION_MODEL}")
-    print(f"✅ Vision Fallback: {Config.HF_VISION_FALLBACK}")
-    print(f"✅ Image Model: {Config.HF_IMAGE_MODEL}")
-    print(f"✅ Image Fallback: {Config.HF_IMAGE_FALLBACK}")
     print("="*50 + "\n")
     
     if Config.USE_WEBHOOK:
