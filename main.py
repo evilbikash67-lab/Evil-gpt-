@@ -23,7 +23,7 @@ import io
 from functools import lru_cache, wraps
 import random
 
-# Aiogram 3.17+ imports - FIXED
+# Aiogram 3.17+ imports
 from aiogram import Bot, Dispatcher, types, F, Router
 from aiogram.types import (
     Message,
@@ -51,9 +51,12 @@ from aiogram.exceptions import (
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.client.default import DefaultBotProperties
+from aiogram.methods import SetWebhook, DeleteWebhook
+from aiogram.types import InputFile as AiogramInputFile
 
 # Web framework for webhooks and health checks
 from fastapi import FastAPI, Request, Response
+from fastapi.responses import JSONResponse
 import uvicorn
 
 # Hugging Face / OpenAI compatible client
@@ -2010,32 +2013,41 @@ Revenue: $0.00
             return "Unknown"
 
 # =========================
-# FASTAPI WEBHOOK HANDLER
+# FASTAPI WEBHOOK HANDLER - AIOGRAM 3.17+ COMPATIBLE
 # =========================
 
 app = FastAPI(title="Evil GPT Webhook")
 user_dispatcher = None
 admin_dispatcher = None
+user_bot = None
+admin_bot = None
 
 @app.post("/webhook/{bot_token}")
 async def webhook_handler(request: Request, bot_token: str):
-    """Handle Telegram webhook updates."""
-    global user_dispatcher, admin_dispatcher
+    """Handle Telegram webhook updates - Aiogram 3.17+ compatible."""
+    global user_dispatcher, admin_dispatcher, user_bot, admin_bot
     
+    # Validate bot token
     if bot_token not in [Config.USER_BOT_TOKEN, Config.ADMIN_BOT_TOKEN]:
         return Response(status_code=403)
     
     try:
+        # Parse update data
         update_data = await request.json()
-        update = Update(**update_data)
         
-        # Route to appropriate dispatcher
+        # Create Update object using model_validate (Aiogram 3.17+)
+        update = Update.model_validate(update_data)
+        
+        # Route to appropriate dispatcher using process_update
         if bot_token == Config.USER_BOT_TOKEN and user_dispatcher:
-            await user_dispatcher.process_update(update)
-        elif bot_token == Config.ADMIN_BOT_TOKEN and admin_dispatcher:
-            await admin_dispatcher.process_update(update)
+            await user_dispatcher.feed_update(user_bot, update)
+        elif bot_token == Config.ADMIN_BOT_TOKEN and admin_dispatcher and admin_bot:
+            await admin_dispatcher.feed_update(admin_bot, update)
+        else:
+            return Response(status_code=404)
         
         return Response(status_code=200)
+        
     except Exception as e:
         logger.error(f"Webhook error: {str(e)}")
         return Response(status_code=500)
@@ -2069,9 +2081,37 @@ async def root():
 # MAIN APPLICATION
 # =========================
 
+async def setup_webhooks():
+    """Setup webhooks for both bots."""
+    global user_bot, admin_bot
+    
+    service_url = os.getenv('SERVICE_URL', 'https://evil-gpt-zehg.onrender.com')
+    webhook_url = f"{service_url}/webhook"
+    
+    # Delete existing webhooks
+    await user_bot.delete_webhook()
+    
+    # Set user webhook
+    await user_bot.set_webhook(
+        url=f"{webhook_url}/{Config.USER_BOT_TOKEN}",
+        allowed_updates=["message", "callback_query", "inline_query"],
+        drop_pending_updates=True
+    )
+    logger.info(f"✅ User bot webhook configured: {webhook_url}/{Config.USER_BOT_TOKEN}")
+    
+    # Setup admin webhook if exists
+    if admin_bot:
+        await admin_bot.delete_webhook()
+        await admin_bot.set_webhook(
+            url=f"{webhook_url}/{Config.ADMIN_BOT_TOKEN}",
+            allowed_updates=["message", "callback_query", "inline_query"],
+            drop_pending_updates=True
+        )
+        logger.info(f"✅ Admin bot webhook configured: {webhook_url}/{Config.ADMIN_BOT_TOKEN}")
+
 async def main():
     """Main application entry point."""
-    global user_dispatcher, admin_dispatcher
+    global user_dispatcher, admin_dispatcher, user_bot, admin_bot
     
     logger.info("🚀 Starting Evil GPT Platform...")
     
@@ -2102,32 +2142,10 @@ async def main():
         admin_handler = AdminBotHandler(admin_bot, admin_router, db, ai_service)
         admin_dispatcher.include_router(admin_router)
     
-    # Get webhook URL
-    service_url = os.getenv('SERVICE_URL', 'https://evil-gpt-zehg.onrender.com')
-    webhook_url = f"{service_url}/webhook"
-    
+    # Start webhook or polling mode
     if Config.USE_WEBHOOK:
         logger.info("🌐 Using webhook mode...")
-        
-        # Set webhooks
-        try:
-            await user_bot.set_webhook(
-                url=f"{webhook_url}/{Config.USER_BOT_TOKEN}",
-                allowed_updates=["message", "callback_query", "inline_query"]
-            )
-            logger.info("✅ User bot webhook configured")
-        except Exception as e:
-            logger.error(f"Failed to set user webhook: {str(e)}")
-        
-        if admin_bot:
-            try:
-                await admin_bot.set_webhook(
-                    url=f"{webhook_url}/{Config.ADMIN_BOT_TOKEN}",
-                    allowed_updates=["message", "callback_query", "inline_query"]
-                )
-                logger.info("✅ Admin bot webhook configured")
-            except Exception as e:
-                logger.error(f"Failed to set admin webhook: {str(e)}")
+        await setup_webhooks()
         
         # Start FastAPI server
         config = uvicorn.Config(app, host="0.0.0.0", port=8080, loop="asyncio", log_level="info")
@@ -2138,6 +2156,11 @@ async def main():
             await server.serve()
         except KeyboardInterrupt:
             logger.info("Shutting down...")
+        finally:
+            # Cleanup webhooks
+            await user_bot.delete_webhook()
+            if admin_bot:
+                await admin_bot.delete_webhook()
     else:
         logger.info("🔄 Using polling mode...")
         
