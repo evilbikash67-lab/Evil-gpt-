@@ -941,6 +941,14 @@ async def build_services() -> Services:
 user_router = Router(name="user")
 
 
+@user_router.errors()
+async def user_error_handler(event) -> bool:
+    """Catches anything a user handler doesn't (e.g. a Telegram API
+    rejection) so a bad message never crashes the webhook/polling loop."""
+    log_exception("user_router", event.exception)
+    return True
+
+
 def is_admin(user_id: int) -> bool:
     return user_id in Config.ADMIN_IDS
 
@@ -1294,6 +1302,14 @@ async def handle_text(message: Message):
 admin_router = Router(name="admin")
 
 
+@admin_router.errors()
+async def admin_error_handler(event) -> bool:
+    """Catches anything an admin handler doesn't (e.g. a Telegram API
+    rejection) so a bad message never crashes the webhook/polling loop."""
+    log_exception("admin_router", event.exception)
+    return True
+
+
 def admin_only(message: Message) -> bool:
     return bool(message.from_user) and is_admin(message.from_user.id)
 
@@ -1306,14 +1322,14 @@ async def admin_start(message: Message):
     await message.answer(
         "Evil GPT — Admin Panel\n\n"
         "/stats — usage statistics\n"
-        "/broadcast <text> — message all users\n"
-        "/ban <user_id>\n"
-        "/unban <user_id>\n"
-        "/mute <user_id>\n"
-        "/unmute <user_id>\n"
-        "/premium <user_id> <on|off>\n"
-        "/setprompt <text> — update system prompt\n"
-        "/maintenance <on|off>"
+        "/broadcast [text] — message all users\n"
+        "/ban [user_id]\n"
+        "/unban [user_id]\n"
+        "/mute [user_id]\n"
+        "/unmute [user_id]\n"
+        "/premium [user_id] [on|off]\n"
+        "/setprompt [text] — update system prompt\n"
+        "/maintenance [on|off]"
     )
 
 
@@ -1348,7 +1364,7 @@ async def admin_ban(message: Message, command: Command):
         return
     target = _parse_target_id(command.args or "")
     if target is None:
-        await message.answer("Usage: /ban <user_id>")
+        await message.answer("Usage: /ban [user_id]")
         return
     await db.set_banned(target, True)
     await message.answer(f"User {target} banned.")
@@ -1360,7 +1376,7 @@ async def admin_unban(message: Message, command: Command):
         return
     target = _parse_target_id(command.args or "")
     if target is None:
-        await message.answer("Usage: /unban <user_id>")
+        await message.answer("Usage: /unban [user_id]")
         return
     await db.set_banned(target, False)
     await message.answer(f"User {target} unbanned.")
@@ -1372,7 +1388,7 @@ async def admin_mute(message: Message, command: Command):
         return
     target = _parse_target_id(command.args or "")
     if target is None:
-        await message.answer("Usage: /mute <user_id>")
+        await message.answer("Usage: /mute [user_id]")
         return
     await db.set_muted(target, True)
     await message.answer(f"User {target} muted.")
@@ -1384,7 +1400,7 @@ async def admin_unmute(message: Message, command: Command):
         return
     target = _parse_target_id(command.args or "")
     if target is None:
-        await message.answer("Usage: /unmute <user_id>")
+        await message.answer("Usage: /unmute [user_id]")
         return
     await db.set_muted(target, False)
     await message.answer(f"User {target} unmuted.")
@@ -1396,7 +1412,7 @@ async def admin_premium(message: Message, command: Command):
         return
     parts = (command.args or "").split()
     if len(parts) != 2 or not parts[0].isdigit() or parts[1] not in ("on", "off"):
-        await message.answer("Usage: /premium <user_id> <on|off>")
+        await message.answer("Usage: /premium [user_id] [on|off]")
         return
     await db.set_premium(int(parts[0]), parts[1] == "on")
     await message.answer(f"Premium {'enabled' if parts[1] == 'on' else 'disabled'} for {parts[0]}.")
@@ -1408,7 +1424,7 @@ async def admin_setprompt(message: Message, command: Command):
         return
     new_prompt = (command.args or "").strip()
     if not new_prompt:
-        await message.answer("Usage: /setprompt <text>")
+        await message.answer("Usage: /setprompt [text]")
         return
     await db.set_setting("system_prompt", new_prompt)
     await message.answer("System prompt updated.")
@@ -1420,7 +1436,7 @@ async def admin_maintenance(message: Message, command: Command):
         return
     arg = (command.args or "").strip().lower()
     if arg not in ("on", "off"):
-        await message.answer("Usage: /maintenance <on|off>")
+        await message.answer("Usage: /maintenance [on|off]")
         return
     await db.set_setting("maintenance_mode", "1" if arg == "on" else "0")
     await message.answer(f"Maintenance mode {'enabled' if arg == 'on' else 'disabled'}.")
@@ -1432,7 +1448,7 @@ async def admin_broadcast(message: Message, command: Command):
         return
     text = (command.args or "").strip()
     if not text:
-        await message.answer("Usage: /broadcast <text>")
+        await message.answer("Usage: /broadcast [text]")
         return
     user_ids = await db.all_user_ids()
     sent, failed = 0, 0
