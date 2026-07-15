@@ -16,7 +16,6 @@ import traceback
 import re
 import io
 import base64
-import aiohttp
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Any, Union
 from contextlib import asynccontextmanager
@@ -37,15 +36,17 @@ from aiogram.client.default import DefaultBotProperties
 from fastapi import FastAPI, Request, Response
 import uvicorn
 
-# Hugging Face Inference Client
-from huggingface_hub import InferenceClient
+# OpenAI client for Hugging Face Router
 from openai import OpenAI
+
+# Hugging Face Inference Client for image generation
+from huggingface_hub import InferenceClient
 
 # Tavily Search
 from tavily import TavilyClient
 
 # Image processing
-from PIL import Image, ImageFilter, ImageEnhance
+from PIL import Image
 
 # Environment management
 from dotenv import load_dotenv
@@ -110,6 +111,14 @@ class Config:
     DATABASE_PATH = os.getenv('DATABASE_PATH', 'evil_gpt.db')
     USE_WEBHOOK = os.getenv('USE_WEBHOOK', 'true').lower() == 'true'
 
+    # Models - All loaded from environment
+    HF_CHAT_MODEL = os.getenv('HF_CHAT_MODEL', 'Qwen/Qwen2.5-VL-72B-Instruct:featherless-ai')
+    HF_CHAT_FALLBACK = os.getenv('HF_CHAT_FALLBACK', 'Qwen/Qwen2-VL-7B-Instruct')
+    HF_VISION_MODEL = os.getenv('HF_VISION_MODEL', 'Qwen/Qwen2.5-VL-72B-Instruct:featherless-ai')
+    HF_VISION_FALLBACK = os.getenv('HF_VISION_FALLBACK', 'Qwen/Qwen2-VL-7B-Instruct')
+    HF_IMAGE_MODEL = os.getenv('HF_IMAGE_MODEL', 'black-forest-labs/FLUX.1-dev')
+    HF_IMAGE_FALLBACK = os.getenv('HF_IMAGE_FALLBACK', 'black-forest-labs/FLUX.1-schnell')
+
     @classmethod
     def validate(cls):
         missing = []
@@ -126,6 +135,12 @@ class Config:
         print(f"✓ HF_TOKEN: {'✅ Loaded' if cls.HF_TOKEN else '❌ Missing'}")
         print(f"✓ TAVILY_API_KEY: {'✅ Loaded' if cls.TAVILY_API_KEY else '⚠️ Optional'}")
         print(f"✓ ADMIN_IDS: {'✅ Loaded' if cls.ADMIN_IDS else '❌ Missing'}")
+        print(f"✓ HF_CHAT_MODEL: {cls.HF_CHAT_MODEL}")
+        print(f"✓ HF_CHAT_FALLBACK: {cls.HF_CHAT_FALLBACK}")
+        print(f"✓ HF_VISION_MODEL: {cls.HF_VISION_MODEL}")
+        print(f"✓ HF_VISION_FALLBACK: {cls.HF_VISION_FALLBACK}")
+        print(f"✓ HF_IMAGE_MODEL: {cls.HF_IMAGE_MODEL}")
+        print(f"✓ HF_IMAGE_FALLBACK: {cls.HF_IMAGE_FALLBACK}")
         print("="*50 + "\n")
         logger.info("✅ All required environment variables validated")
 
@@ -341,7 +356,7 @@ class RateLimiter:
 
     async def check_limit(self, user_id, action, max_count, period):
         try:
-            async with self.db.get_connection() as conn:
+            async with self.get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute("""
                     SELECT count, last_reset FROM rate_limits 
@@ -374,14 +389,31 @@ class RateLimiter:
             return True, max_count - 1
 
 # =========================
-# AI SERVICE - Hugging Face Inference API
+# AI SERVICE - All Models Integrated
 # =========================
 
 class AIService:
-    """Handles all AI operations using the Hugging Face Inference API."""
+    """Handles all AI operations with all requested models."""
     
     def __init__(self):
         self.db = Database()
+        
+        # Initialize OpenAI client for Hugging Face Router (Chat + Vision)
+        self.chat_client = OpenAI(
+            base_url="https://router.huggingface.co/v1",
+            api_key=Config.HF_TOKEN,
+            timeout=120.0
+        )
+        logger.info("✅ Hugging Face Router client initialized")
+        
+        # Initialize InferenceClient for Image Generation (FLUX models)
+        self.image_client = InferenceClient(
+            provider="fal-ai",
+            api_key=Config.HF_TOKEN,
+        )
+        logger.info("✅ Hugging Face Image client initialized")
+        
+        # Initialize Tavily
         self.tavily_client = None
         if Config.TAVILY_API_KEY:
             try:
@@ -390,48 +422,33 @@ class AIService:
             except Exception as e:
                 logger.error(f"❌ Tavily init failed: {str(e)}")
         
-        # Initialize Hugging Face client
-        self.client = InferenceClient(
-            token=Config.HF_TOKEN,
-            timeout=120.0
-        )
-        logger.info("✅ Hugging Face client initialized")
-        
-        # Model fallback lists
-        self.chat_models = [
-            "Qwen/Qwen2.5-72B-Instruct",
-            "mistralai/Mistral-7B-Instruct-v0.3",
-            "microsoft/Phi-3-mini-4k-instruct",
-            "google/gemma-2-27b-it",
-        ]
-        
-        self.vision_models = [
-            "Qwen/Qwen2-VL-72B-Instruct",
-            "Salesforce/blip-image-captioning-large",
-        ]
-        
-        self.image_gen_models = [
-            "stabilityai/stable-diffusion-xl-base-1.0",
-            "CompVis/stable-diffusion-v1-4",
-            "runwayml/stable-diffusion-v1-5",
-        ]
+        # Log all models being used
+        logger.info(f"📌 Chat Model: {Config.HF_CHAT_MODEL}")
+        logger.info(f"📌 Chat Fallback: {Config.HF_CHAT_FALLBACK}")
+        logger.info(f"📌 Vision Model: {Config.HF_VISION_MODEL}")
+        logger.info(f"📌 Vision Fallback: {Config.HF_VISION_FALLBACK}")
+        logger.info(f"📌 Image Model: {Config.HF_IMAGE_MODEL}")
+        logger.info(f"📌 Image Fallback: {Config.HF_IMAGE_FALLBACK}")
 
     async def generate_chat_response(self, messages: List[Dict], user_id: int = None) -> Tuple[str, Dict]:
-        """Generate chat response with automatic model fallback."""
+        """Generate chat response with automatic fallback."""
         system_prompt = await self.db.get_active_system_prompt()
         full_messages = [{"role": "system", "content": system_prompt}] + messages
         
+        # Try primary model first, then fallback
+        models_to_try = [Config.HF_CHAT_MODEL, Config.HF_CHAT_FALLBACK]
         last_error = None
-        for model in self.chat_models:
+        
+        for model in models_to_try:
             try:
                 logger.info(f"Attempting chat with model: {model}")
-                response = self.client.chat_completion(
+                completion = self.chat_client.chat.completions.create(
                     model=model,
                     messages=full_messages,
                     max_tokens=2048,
                     temperature=0.7,
                 )
-                response_text = response['choices'][0]['message']['content']
+                response_text = completion.choices[0].message.content
                 logger.info(f"✅ Chat response generated using model: {model}")
                 return response_text, {'model': model, 'success': True}
             except Exception as e:
@@ -440,19 +457,31 @@ class AIService:
                 continue
         
         logger.error(f"All chat models failed. Last error: {str(last_error)}")
-        raise Exception("Chat service unavailable")
+        raise Exception(f"Chat service unavailable: {str(last_error)}")
 
     async def generate_vision_response(self, image_url: str, prompt: str, user_id: int = None) -> Tuple[str, Dict]:
         """Analyze an image using vision models."""
+        models_to_try = [Config.HF_VISION_MODEL, Config.HF_VISION_FALLBACK]
         last_error = None
-        for model in self.vision_models:
+        
+        for model in models_to_try:
             try:
                 logger.info(f"Attempting vision with model: {model}")
-                response = self.client.image_to_text(
-                    image=image_url,
+                completion = self.chat_client.chat.completions.create(
                     model=model,
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": prompt},
+                                {"type": "image_url", "image_url": {"url": image_url}}
+                            ]
+                        }
+                    ],
+                    max_tokens=1024,
+                    temperature=0.7,
                 )
-                response_text = response[0]['generated_text'] if isinstance(response, list) else str(response)
+                response_text = completion.choices[0].message.content
                 logger.info(f"✅ Vision response generated using model: {model}")
                 return response_text, {'model': model, 'success': True}
             except Exception as e:
@@ -461,30 +490,37 @@ class AIService:
                 continue
         
         logger.error(f"All vision models failed. Last error: {str(last_error)}")
-        raise Exception("Vision service unavailable")
+        raise Exception(f"Vision service unavailable: {str(last_error)}")
 
     async def generate_image(self, prompt: str, user_id: int = None) -> Tuple[bytes, str]:
-        """Generate an image from a text prompt."""
+        """Generate image using FLUX models with automatic fallback."""
+        models_to_try = [Config.HF_IMAGE_MODEL, Config.HF_IMAGE_FALLBACK]
         last_error = None
-        for model in self.image_gen_models:
+        
+        for model in models_to_try:
             try:
                 logger.info(f"Attempting image generation with model: {model}")
-                enhanced_prompt = f"High quality, detailed: {prompt}"
-                image = self.client.text_to_image(
-                    prompt=enhanced_prompt,
+                enhanced_prompt = f"High quality, detailed, professional: {prompt}"
+                
+                image = self.image_client.text_to_image(
+                    enhanced_prompt,
                     model=model,
                 )
+                
+                # Convert PIL Image to bytes
                 img_bytes = io.BytesIO()
                 image.save(img_bytes, format='PNG')
+                image_bytes = img_bytes.getvalue()
+                
                 logger.info(f"✅ Image generated using model: {model}")
-                return img_bytes.getvalue(), model
+                return image_bytes, model
             except Exception as e:
                 last_error = e
                 logger.warning(f"Image model {model} failed: {str(e)}")
                 continue
         
         logger.error(f"All image models failed. Last error: {str(last_error)}")
-        raise Exception("Image generation unavailable")
+        raise Exception(f"Image generation unavailable: {str(last_error)}")
 
     async def search_and_respond(self, query: str, user_id: int = None) -> Tuple[str, List[str]]:
         """Search Tavily and return a summarized response."""
@@ -564,6 +600,8 @@ Just send a message, image, or request.
 • Remove background
 • Write Python code
 • Design a logo
+
+*All features work automatically.*
 """
         await message.answer(welcome, parse_mode=ParseMode.MARKDOWN)
     
@@ -578,7 +616,6 @@ No commands required. I'll handle the rest.
 • Ask about latest news
 • Generate images
 • Analyze photos
-• Edit images
 • Write code
 """)
     
@@ -599,32 +636,22 @@ No commands required. I'll handle the rest.
         
         text_lower = message_text.lower()
         
-        # Image editing (hidden)
-        edit_triggers = [
-            'remove background', 'change background', 'replace background',
-            'remove this', 'remove object', 'remove person',
-            'change outfit', 'change clothes', 'make it anime', 'cartoon style',
-            'upscale', 'enhance', 'improve', 'fix image', 'restore',
-            'add sunglasses', 'add hat', 'add object', 'edit this',
-            'change color', 'change hair', 'realistic style'
-        ]
-        if has_image and any(trigger in text_lower for trigger in edit_triggers):
-            return "image_edit"
-        
         # Vision
         if has_image:
             return "vision"
         
-        # Image generation
+        # Image Generation
         gen_triggers = ['create', 'generate', 'draw', 'make', 'design', 'produce', 'imagine', 'paint']
         if any(trigger in text_lower for trigger in gen_triggers) and not any(q in text_lower for q in ['how to', 'what is']):
             return "image_generation"
         
         # Search
-        search_triggers = ['latest', 'news', 'today', 'current', 'weather', 'sports', 'crypto', 'stock', 'price', 'who won']
+        search_triggers = ['latest', 'news', 'today', 'current', 'weather', 'sports', 
+                          'crypto', 'stock', 'price', 'who won', 'score', 'result']
         if any(trigger in text_lower for trigger in search_triggers):
             return "search"
         
+        # Chat is default
         return "chat"
     
     @send_typing(ChatAction.TYPING)
@@ -786,7 +813,7 @@ No commands required. I'll handle the rest.
             await message.answer("Sorry, I couldn't analyze that image. Please try again.")
 
 # =========================
-# ADMIN BOT (Kept for compatibility)
+# ADMIN BOT
 # =========================
 
 class AdminBotHandler:
@@ -939,6 +966,12 @@ async def main():
     print("✅ Admin Bot Connected" if admin_bot else "⚠️ Admin Bot Not Configured")
     print("✅ Database Connected")
     print("✅ Intent Detection: Active")
+    print(f"✅ Chat Model: {Config.HF_CHAT_MODEL}")
+    print(f"✅ Chat Fallback: {Config.HF_CHAT_FALLBACK}")
+    print(f"✅ Vision Model: {Config.HF_VISION_MODEL}")
+    print(f"✅ Vision Fallback: {Config.HF_VISION_FALLBACK}")
+    print(f"✅ Image Model: {Config.HF_IMAGE_MODEL}")
+    print(f"✅ Image Fallback: {Config.HF_IMAGE_FALLBACK}")
     print("="*50 + "\n")
     
     if Config.USE_WEBHOOK:
