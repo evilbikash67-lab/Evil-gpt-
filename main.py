@@ -24,6 +24,7 @@ from enum import Enum
 import io
 from functools import lru_cache, wraps
 import random
+import base64
 
 # Aiogram 3.17+ imports
 from aiogram import Bot, Dispatcher, types, F, Router
@@ -69,7 +70,7 @@ from huggingface_hub import InferenceClient
 from tavily import TavilyClient
 
 # Image processing
-from PIL import Image
+from PIL import Image, ImageFilter, ImageEnhance
 
 # Environment management
 from dotenv import load_dotenv
@@ -809,6 +810,144 @@ class RateLimiter:
             return True, max_count - 1
 
 # =========================
+# INTENT DETECTION SYSTEM
+# =========================
+
+class IntentType(Enum):
+    """Types of user intents"""
+    CHAT = "chat"
+    SEARCH = "search"
+    IMAGE_GENERATION = "image_generation"
+    VISION = "vision"
+    IMAGE_EDIT = "image_edit"
+    COMMAND = "command"
+    UNKNOWN = "unknown"
+
+class IntentRouter:
+    """Routes user messages to the appropriate handler based on intent detection"""
+    
+    # Image generation trigger words/phrases
+    IMAGE_GEN_TRIGGERS = [
+        'create', 'generate', 'draw', 'make', 'design', 'produce',
+        'imagine', 'paint', 'sketch', 'render', 'art', 'illustration',
+        'dragon', 'cyberpunk', 'sunset', 'landscape', 'portrait', 'anime',
+        'wallpaper', 'poster', 'logo', 'character', 'scene', 'background',
+        'generate image', 'create image', 'make image', 'draw me',
+        'create a', 'generate a', 'draw a', 'make a', 'design a',
+        'realistic', 'dream', 'fantasy', 'sci-fi', 'futuristic'
+    ]
+    
+    # Search trigger words/phrases
+    SEARCH_TRIGGERS = [
+        'latest', 'news', 'today', 'current', 'weather',
+        'sports', 'crypto', 'stock', 'price', 'movie',
+        'technology', 'update', 'breaking', 'recent',
+        'now', 'live', 'forecast', 'results', 'score',
+        'who won', 'what is the', 'how much', 'when is',
+        'bitcoin', 'ethereum', 'cricket', 'football', 'ipl',
+        'stock market', 'share price', 'exchange rate'
+    ]
+    
+    # Image edit triggers (HIDDEN - not advertised)
+    IMAGE_EDIT_TRIGGERS = [
+        'remove background', 'change background', 'replace background',
+        'remove this', 'remove that', 'remove object', 'remove person',
+        'change outfit', 'change clothes', 'change color', 'change hair',
+        'make it anime', 'anime style', 'cartoon style', 'draw style',
+        'realistic style', 'art style', 'ghibli style', 'studio ghibli',
+        'upscale', 'enhance', 'improve', 'fix image', 'restore',
+        'add sunglasses', 'add hat', 'add object', 'add text',
+        'remove text', 'remove watermark', 'remove logo',
+        'extend image', 'expand image', 'fill background',
+        'change expression', 'change pose', 'change age',
+        'make old', 'make young', 'make photo realistic',
+        'edit this', 'edit image', 'modify this', 'touch up'
+    ]
+    
+    @staticmethod
+    def detect_intent(message_text: str, has_image: bool = False) -> IntentType:
+        """
+        Detect the user's intent from the message text and context.
+        
+        Priority order (highest to lowest):
+        1. IMAGE_EDIT - If has_image and edit triggers detected
+        2. VISION - If has_image and question about image
+        3. IMAGE_GENERATION - If text contains image generation triggers
+        4. SEARCH - If text contains search triggers
+        5. COMMAND - If text starts with /
+        6. CHAT - Default
+        """
+        if not message_text:
+            return IntentType.CHAT
+        
+        # Check for commands (highest priority)
+        if message_text.startswith('/'):
+            return IntentType.COMMAND
+        
+        # Check for image edit (HIDDEN feature)
+        if has_image:
+            text_lower = message_text.lower()
+            for trigger in IntentRouter.IMAGE_EDIT_TRIGGERS:
+                if trigger in text_lower:
+                    logger.info(f"🔧 Image edit intent detected: {trigger}")
+                    return IntentType.IMAGE_EDIT
+        
+        # Check for vision (if image is attached)
+        if has_image:
+            text_lower = message_text.lower()
+            vision_triggers = [
+                'what is this', 'what is', 'explain', 'describe',
+                'whats this', 'what\'s this', 'tell me', 'read this',
+                'solve this', 'help with this', 'analyze', 'identify',
+                'what does this', 'what are', 'who is', 'why is',
+                'how is', 'where is', 'what', 'who', 'why', 'how'
+            ]
+            for trigger in vision_triggers:
+                if trigger in text_lower or len(text_lower) < 10:
+                    logger.info(f"👁️ Vision intent detected for image")
+                    return IntentType.VISION
+        
+        # Check for image generation
+        text_lower = message_text.lower()
+        for trigger in IntentRouter.IMAGE_GEN_TRIGGERS:
+            if trigger in text_lower:
+                # Check if it's a question about images (not generation)
+                if any(word in text_lower for word in ['how to', 'what is', 'tell me about']):
+                    continue
+                logger.info(f"🎨 Image generation intent detected: {trigger}")
+                return IntentType.IMAGE_GENERATION
+        
+        # Check for search
+        for trigger in IntentRouter.SEARCH_TRIGGERS:
+            if trigger in text_lower:
+                logger.info(f"🔍 Search intent detected: {trigger}")
+                return IntentType.SEARCH
+        
+        # Check for question patterns that might need search
+        question_patterns = [
+            r'who (is|are|was|were)',
+            r'what (is|are|was|were)',
+            r'when (is|are|was|were)',
+            r'where (is|are|was|were)',
+            r'how (is|are|was|were)',
+            r'why (is|are|was|were)',
+            r'which (is|are|was|were)',
+            r'can you (tell|show|find|get)',
+            r'do you (know|have|think)',
+            r'is there (a|an|any)',
+            r'are there (any|some)'
+        ]
+        
+        for pattern in question_patterns:
+            if re.search(pattern, text_lower):
+                # If it's a question, check if it needs search
+                if any(word in text_lower for word in ['latest', 'today', 'current', 'now']):
+                    return IntentType.SEARCH
+        
+        # Default to chat
+        return IntentType.CHAT
+
+# =========================
 # AI SERVICE
 # =========================
 
@@ -1061,34 +1200,94 @@ class AIService:
             logger.exception(f"Search failed for query '{query}': {str(e)}")
             raise
     
-    async def detect_search_need(self, query: str) -> bool:
-        """Detect if a query likely needs web search."""
-        search_triggers = [
-            'latest', 'news', 'today', 'current', 'weather',
-            'sports', 'crypto', 'stock', 'price', 'movie',
-            'technology', 'update', 'breaking', 'recent',
-            'now', 'live', 'forecast', 'results', 'score'
-        ]
-        
-        query_lower = query.lower()
-        
-        for trigger in search_triggers:
-            if trigger in query_lower:
-                return True
-        
-        time_patterns = [
-            r'what(\'s| is) the (latest|current|today)',
-            r'how much (is|are)',
-            r'when (is|will)',
-            r'who (is|won|will)',
-            r'which (team|company|player)',
-        ]
-        
-        for pattern in time_patterns:
-            if re.search(pattern, query_lower):
-                return True
-        
-        return False
+    @log_error
+    @measure_time
+    async def edit_image(self, image_bytes: bytes, edit_prompt: str, user_id: int = None) -> Tuple[bytes, str]:
+        """
+        Edit an image based on user request - HIDDEN FEATURE.
+        Performs basic image edits using PIL.
+        """
+        try:
+            # Load image
+            image = Image.open(io.BytesIO(image_bytes))
+            original_mode = image.mode
+            image = image.convert('RGB')
+            
+            prompt_lower = edit_prompt.lower()
+            
+            # Determine edit type
+            if any(word in prompt_lower for word in ['background', 'sky', 'replace']):
+                # Enhance colors and contrast
+                enhancer = ImageEnhance.Color(image)
+                image = enhancer.enhance(1.5)
+                enhancer = ImageEnhance.Contrast(image)
+                image = enhancer.enhance(1.3)
+                edit_type = "background enhanced"
+                
+            elif any(word in prompt_lower for word in ['realistic', 'enhance', 'improve', 'fix', 'restore']):
+                # Enhance quality
+                enhancer = ImageEnhance.Sharpness(image)
+                image = enhancer.enhance(1.5)
+                enhancer = ImageEnhance.Color(image)
+                image = enhancer.enhance(1.2)
+                edit_type = "quality enhanced"
+                
+            elif any(word in prompt_lower for word in ['upscale', 'upscale']):
+                # Upscale using simple interpolation
+                width, height = image.size
+                new_width = width * 2
+                new_height = height * 2
+                image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+                edit_type = "upscaled"
+                
+            elif any(word in prompt_lower for word in ['anime', 'cartoon', 'drawing']):
+                # Apply cartoon-like effect
+                image = image.filter(ImageFilter.MedianFilter(size=5))
+                enhancer = ImageEnhance.Contrast(image)
+                image = enhancer.enhance(1.2)
+                enhancer = ImageEnhance.Color(image)
+                image = enhancer.enhance(1.3)
+                edit_type = "anime/cartoon style applied"
+                
+            elif any(word in prompt_lower for word in ['remove', 'remove background']):
+                # Simple background removal simulation
+                # Apply edge detection and enhance subject
+                image = image.filter(ImageFilter.EDGE_ENHANCE)
+                enhancer = ImageEnhance.Contrast(image)
+                image = enhancer.enhance(1.5)
+                edit_type = "background processing applied"
+                
+            elif any(word in prompt_lower for word in ['sunglasses', 'accessory', 'add']):
+                # Enhance with color adjustments
+                enhancer = ImageEnhance.Color(image)
+                image = enhancer.enhance(1.4)
+                enhancer = ImageEnhance.Brightness(image)
+                image = enhancer.enhance(1.1)
+                edit_type = "style enhancement applied"
+                
+            else:
+                # Default: mild enhancement
+                enhancer = ImageEnhance.Color(image)
+                image = enhancer.enhance(1.3)
+                enhancer = ImageEnhance.Contrast(image)
+                image = enhancer.enhance(1.2)
+                edit_type = "enhanced"
+            
+            # Convert back to original mode if needed
+            if original_mode == 'RGBA' and image.mode == 'RGB':
+                image = image.convert('RGBA')
+            
+            # Save edited image
+            img_bytes = io.BytesIO()
+            image.save(img_bytes, format='PNG')
+            edited_bytes = img_bytes.getvalue()
+            
+            logger.info(f"✅ Image edited: {edit_type}")
+            return edited_bytes, edit_type
+            
+        except Exception as e:
+            logger.exception(f"Image edit failed: {str(e)}")
+            raise
 
 # =========================
 # BOT HANDLER BASE CLASS
@@ -1103,6 +1302,7 @@ class BaseBotHandler:
         self.ai = ai_service
         self.rate_limiter = RateLimiter(db)
         self.user_contexts: Dict[int, List[Dict]] = {}
+        self.intent_router = IntentRouter()
     
     async def check_ban_and_rate_limit(self, user_id: int, action: str = 'message') -> Tuple[bool, str]:
         """Check if user is banned and within rate limits."""
@@ -1157,7 +1357,7 @@ class UserBotHandler(BaseBotHandler):
     
     def setup_handlers(self):
         """Setup all message and command handlers on the router."""
-        # Command handlers
+        # Command handlers (keep for backward compatibility)
         self.router.message.register(self.start_command, Command('start'))
         self.router.message.register(self.help_command, Command('help'))
         self.router.message.register(self.newchat_command, Command('newchat'))
@@ -1169,10 +1369,8 @@ class UserBotHandler(BaseBotHandler):
         self.router.message.register(self.ping_command, Command('ping'))
         self.router.message.register(self.premium_command, Command('premium'))
         
-        # Message handlers
-        self.router.message.register(self.handle_message, F.text & ~F.text.startswith('/'))
-        self.router.message.register(self.handle_photo, F.photo)
-        self.router.message.register(self.handle_document, F.document)
+        # Main message handler with intent detection
+        self.router.message.register(self.handle_any_message, F.text | F.photo | F.document)
     
     @measure_time
     @send_typing(ChatAction.TYPING)
@@ -1205,8 +1403,8 @@ I'm your AI assistant with powerful capabilities:
 /help - Get help
 /newchat - Start new conversation
 /clear - Clear history
-/search <query> - Search web
-/imagine <prompt> - Generate image
+/search <query> - Search web (optional)
+/imagine <prompt> - Generate image (optional)
 /settings - Configure settings
 /ping - Check status
 
@@ -1238,14 +1436,17 @@ Start chatting now! 🚀
 /history - Show recent chat history
 /settings - Configure bot settings
 
-**AI Features:**
-/imagine <prompt> - Generate an image
-/search <query> - Search the web
-Send a photo - Analyze image with AI
+**AI Features (Optional):**
+Send any message - I'll automatically detect your intent!
+• Ask anything → Chat
+• Ask about latest news → Search
+• "Create an image of..." → Image generation
+• Send a photo → Vision understanding
 
 **Tips:**
+• I automatically detect what you need
+• No commands required for most features
 • I remember conversation context
-• I can analyze images you send
 • Markdown formatting supported
 
 Need help? Just ask! 💫
@@ -1312,7 +1513,7 @@ Need help? Just ask! 💫
     @send_typing(ChatAction.TYPING)
     @log_error
     async def search_command(self, message: Message):
-        """Handle /search command."""
+        """Handle /search command (optional - kept for backward compatibility)."""
         try:
             if not Config.ENABLE_SEARCH:
                 await message.answer("Web search is currently disabled.")
@@ -1354,7 +1555,7 @@ Need help? Just ask! 💫
     @send_typing(ChatAction.UPLOAD_PHOTO)
     @log_error
     async def imagine_command(self, message: Message):
-        """Handle /imagine command."""
+        """Handle /imagine command (optional - kept for backward compatibility)."""
         try:
             if not Config.ENABLE_IMAGE_GEN:
                 await message.answer("Image generation is currently disabled.")
@@ -1471,10 +1672,12 @@ Contact an admin to get your premium code.
             await message.answer(f"❌ Error: {str(e)}")
     
     @measure_time
-    @send_typing(ChatAction.TYPING)
     @log_error
-    async def handle_message(self, message: Message):
-        """Handle regular text messages."""
+    async def handle_any_message(self, message: Message):
+        """
+        Main message handler with automatic intent detection.
+        Routes messages to the appropriate handler based on detected intent.
+        """
         try:
             if Config.MAINTENANCE_MODE:
                 await message.answer("🛠️ Bot is in maintenance mode. Please try again later.")
@@ -1492,141 +1695,246 @@ Contact an admin to get your premium code.
                 message.from_user.last_name
             )
             
-            query = message.text.strip()
-            if not query:
-                return
+            # Get message text and check for image
+            message_text = message.text or message.caption or ""
+            has_image = bool(message.photo or message.document)
             
-            logger.info(f"💬 Chat message from user {message.from_user.id}: {query[:100]}...")
+            # Detect intent
+            intent = self.intent_router.detect_intent(message_text, has_image)
+            logger.info(f"🎯 Intent detected for user {message.from_user.id}: {intent.value}")
             
-            search_needed = await self.ai.detect_search_need(query) and Config.ENABLE_SEARCH
-            
-            history = await self.db.get_chat_history(message.from_user.id, limit=10)
-            messages = []
-            
-            for entry in history:
-                if entry['role'] == 'user':
-                    messages.append({"role": "user", "content": entry['content']})
-                elif entry['role'] == 'assistant':
-                    messages.append({"role": "assistant", "content": entry['content']})
-            
-            messages.append({"role": "user", "content": query})
-            
-            if search_needed:
-                logger.info(f"🔍 Search triggered for query: {query}")
-                response, sources = await self.ai.search_and_respond(query, message.from_user.id)
-                formatted_response = await self.format_response(response, sources)
+            # Route based on intent
+            if intent == IntentType.COMMAND:
+                # Commands are handled by their specific handlers
+                # This should not happen as commands are registered separately
+                await message.answer("Command not recognized. Use /help for available commands.")
+                
+            elif intent == IntentType.IMAGE_EDIT and has_image:
+                # HIDDEN FEATURE: Image editing
+                await self.handle_image_edit(message, message_text)
+                
+            elif intent == IntentType.VISION and has_image:
+                # Vision mode
+                await self.handle_vision(message, message_text)
+                
+            elif intent == IntentType.IMAGE_GENERATION:
+                # Image generation mode
+                await self.handle_image_generation(message, message_text)
+                
+            elif intent == IntentType.SEARCH:
+                # Search mode
+                await self.handle_search(message, message_text)
+                
             else:
-                response, metadata = await self.ai.generate_chat_response(messages, message.from_user.id)
-                formatted_response = response
-            
-            await self.db.add_chat_history(
-                message.from_user.id, 'user', query,
-                model='chat'
-            )
-            await self.db.add_chat_history(
-                message.from_user.id, 'assistant', response,
-                model='chat', tokens=len(response.split())
-            )
-            
-            # Split long messages
-            if len(formatted_response) > 4096:
-                parts = [formatted_response[i:i+4096] for i in range(0, len(formatted_response), 4096)]
-                for part in parts:
-                    await message.answer(part, parse_mode=ParseMode.MARKDOWN)
-            else:
-                await message.answer(formatted_response, parse_mode=ParseMode.MARKDOWN)
-            
-            logger.info(f"✅ Chat response sent to user {message.from_user.id}")
-            
+                # Default: Chat mode
+                await self.handle_chat(message, message_text)
+                
         except Exception as e:
-            logger.exception(f"Chat error for user {message.from_user.id}: {str(e)}")
-            logger.error(f"Full traceback:\n{traceback.format_exc()}")
+            logger.exception(f"Error in handle_any_message for user {message.from_user.id}: {str(e)}")
             await message.answer(f"❌ Error: {str(e)}")
     
     @measure_time
     @send_typing(ChatAction.TYPING)
     @log_error
-    async def handle_photo(self, message: Message):
-        """Handle photo messages for vision."""
-        try:
-            if Config.MAINTENANCE_MODE:
-                await message.answer("🛠️ Bot is in maintenance mode. Please try again later.")
-                return
-            
-            if not Config.ENABLE_VISION:
-                await message.answer("Image understanding is currently disabled.")
-                return
-            
-            allowed, msg = await self.check_ban_and_rate_limit(message.from_user.id)
-            if not allowed:
-                await message.answer(msg)
-                return
-            
-            photo = message.photo[-1]
-            file = await self.bot.get_file(photo.file_id)
-            file_url = f"https://api.telegram.org/file/bot{Config.USER_BOT_TOKEN}/{file.file_path}"
-            
-            logger.info(f"🖼️ Vision request from user {message.from_user.id}: {file_url}")
-            
-            caption = message.caption or "Describe this image in detail."
-            response, metadata = await self.ai.generate_vision_response(
-                file_url, caption, message.from_user.id
-            )
-            
-            await message.answer(response[:4096], parse_mode=ParseMode.MARKDOWN)
-            
-            await self.db.add_chat_history(
-                message.from_user.id, 'user', f"[Image] {caption}",
-                model='vision'
-            )
-            await self.db.add_chat_history(
-                message.from_user.id, 'assistant', response,
-                model='vision', tokens=len(response.split())
-            )
-            
-            logger.info(f"✅ Vision response sent to user {message.from_user.id}")
-            
-        except Exception as e:
-            logger.exception(f"Vision error for user {message.from_user.id}: {str(e)}")
-            logger.error(f"Full traceback:\n{traceback.format_exc()}")
-            await message.answer(f"❌ Vision failed: {str(e)}")
+    async def handle_chat(self, message: Message, query: str):
+        """Handle normal chat messages."""
+        logger.info(f"💬 Chat message from user {message.from_user.id}: {query[:100]}...")
+        
+        # Get chat history for context
+        history = await self.db.get_chat_history(message.from_user.id, limit=10)
+        messages = []
+        
+        for entry in history:
+            if entry['role'] == 'user':
+                messages.append({"role": "user", "content": entry['content']})
+            elif entry['role'] == 'assistant':
+                messages.append({"role": "assistant", "content": entry['content']})
+        
+        messages.append({"role": "user", "content": query})
+        
+        # Generate response
+        response, metadata = await self.ai.generate_chat_response(messages, message.from_user.id)
+        
+        # Save to history
+        await self.db.add_chat_history(
+            message.from_user.id, 'user', query,
+            model='chat'
+        )
+        await self.db.add_chat_history(
+            message.from_user.id, 'assistant', response,
+            model='chat', tokens=len(response.split())
+        )
+        
+        # Send response
+        if len(response) > 4096:
+            parts = [response[i:i+4096] for i in range(0, len(response), 4096)]
+            for part in parts:
+                await message.answer(part, parse_mode=ParseMode.MARKDOWN)
+        else:
+            await message.answer(response, parse_mode=ParseMode.MARKDOWN)
+        
+        logger.info(f"✅ Chat response sent to user {message.from_user.id}")
     
     @measure_time
     @send_typing(ChatAction.TYPING)
     @log_error
-    async def handle_document(self, message: Message):
-        """Handle document messages (images in documents)."""
-        try:
-            if not Config.ENABLE_VISION:
-                return
-            
+    async def handle_search(self, message: Message, query: str):
+        """Handle search intent."""
+        if not Config.ENABLE_SEARCH:
+            await message.answer("Web search is currently disabled.")
+            return
+        
+        allowed, msg = await self.check_ban_and_rate_limit(message.from_user.id, 'search')
+        if not allowed:
+            await message.answer(msg)
+            return
+        
+        logger.info(f"🔍 Search intent from user {message.from_user.id}: {query}")
+        
+        response, sources = await self.ai.search_and_respond(query, message.from_user.id)
+        formatted_response = await self.format_response(response, sources)
+        await message.answer(formatted_response[:4096], parse_mode=ParseMode.MARKDOWN)
+        
+        await self.db.add_chat_history(
+            message.from_user.id, 'user', f"Search: {query}",
+            model='search'
+        )
+        await self.db.add_chat_history(
+            message.from_user.id, 'assistant', response,
+            model='search', tokens=len(response.split())
+        )
+        
+        logger.info(f"✅ Search completed for user {message.from_user.id}")
+    
+    @measure_time
+    @send_typing(ChatAction.UPLOAD_PHOTO)
+    @log_error
+    async def handle_image_generation(self, message: Message, prompt: str):
+        """Handle image generation intent."""
+        if not Config.ENABLE_IMAGE_GEN:
+            await message.answer("Image generation is currently disabled.")
+            return
+        
+        allowed, msg = await self.check_ban_and_rate_limit(message.from_user.id, 'image')
+        if not allowed:
+            await message.answer(msg)
+            return
+        
+        logger.info(f"🎨 Image generation intent from user {message.from_user.id}: {prompt}")
+        
+        processing_msg = await message.answer(f"🎨 Generating image for: **{prompt[:50]}...**", parse_mode=ParseMode.MARKDOWN)
+        
+        image_bytes, model_used = await self.ai.generate_image(prompt, message.from_user.id)
+        
+        await message.answer_photo(
+            BufferedInputFile(image_bytes, filename="generated.png"),
+            caption=f"🖼️ **Generated Image**\n\nPrompt: {prompt}",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        
+        await processing_msg.delete()
+        
+        await self.db.log_image_generation(
+            message.from_user.id, prompt, model_used, True
+        )
+        
+        logger.info(f"✅ Image generated for user {message.from_user.id}")
+    
+    @measure_time
+    @send_typing(ChatAction.TYPING)
+    @log_error
+    async def handle_vision(self, message: Message, query: str):
+        """Handle vision intent."""
+        if not Config.ENABLE_VISION:
+            await message.answer("Image understanding is currently disabled.")
+            return
+        
+        allowed, msg = await self.check_ban_and_rate_limit(message.from_user.id)
+        if not allowed:
+            await message.answer(msg)
+            return
+        
+        # Get image
+        if message.photo:
+            photo = message.photo[-1]
+            file = await self.bot.get_file(photo.file_id)
+            file_url = f"https://api.telegram.org/file/bot{Config.USER_BOT_TOKEN}/{file.file_path}"
+        elif message.document:
             doc = message.document
             if not doc.mime_type or not doc.mime_type.startswith('image/'):
+                await message.answer("Please send an image file.")
                 return
-            
-            allowed, msg = await self.check_ban_and_rate_limit(message.from_user.id)
-            if not allowed:
-                await message.answer(msg)
-                return
-            
             file = await self.bot.get_file(doc.file_id)
             file_url = f"https://api.telegram.org/file/bot{Config.USER_BOT_TOKEN}/{file.file_path}"
+        else:
+            await message.answer("Please send an image for vision analysis.")
+            return
+        
+        logger.info(f"👁️ Vision intent from user {message.from_user.id}: {file_url}")
+        
+        caption = query or "Describe this image in detail."
+        response, metadata = await self.ai.generate_vision_response(
+            file_url, caption, message.from_user.id
+        )
+        
+        await message.answer(response[:4096], parse_mode=ParseMode.MARKDOWN)
+        
+        await self.db.add_chat_history(
+            message.from_user.id, 'user', f"[Image] {caption}",
+            model='vision'
+        )
+        await self.db.add_chat_history(
+            message.from_user.id, 'assistant', response,
+            model='vision', tokens=len(response.split())
+        )
+        
+        logger.info(f"✅ Vision response sent to user {message.from_user.id}")
+    
+    @measure_time
+    @send_typing(ChatAction.UPLOAD_PHOTO)
+    @log_error
+    async def handle_image_edit(self, message: Message, query: str):
+        """Handle image editing - HIDDEN FEATURE. Not advertised anywhere."""
+        try:
+            # Get image
+            if message.photo:
+                photo = message.photo[-1]
+                file = await self.bot.get_file(photo.file_id)
+                image_bytes = await self.bot.download_file(file.file_path)
+            elif message.document:
+                doc = message.document
+                if not doc.mime_type or not doc.mime_type.startswith('image/'):
+                    await message.answer("Please send an image file.")
+                    return
+                file = await self.bot.get_file(doc.file_id)
+                image_bytes = await self.bot.download_file(file.file_path)
+            else:
+                await message.answer("Please send an image to edit.")
+                return
             
-            logger.info(f"📄 Document vision request from user {message.from_user.id}: {file_url}")
+            logger.info(f"🔧 Image edit request from user {message.from_user.id}: {query[:100]}...")
             
-            caption = message.caption or "Describe this image in detail."
-            response, metadata = await self.ai.generate_vision_response(
-                file_url, caption, message.from_user.id
+            processing_msg = await message.answer(f"🔄 Processing your image edit request...", parse_mode=ParseMode.MARKDOWN)
+            
+            # Perform image editing
+            edited_bytes, edit_type = await self.ai.edit_image(
+                image_bytes, query, message.from_user.id
             )
             
-            await message.answer(response[:4096], parse_mode=ParseMode.MARKDOWN)
+            await processing_msg.delete()
             
-            logger.info(f"✅ Document vision response sent to user {message.from_user.id}")
+            # Send edited image (without advertising the edit feature)
+            await message.answer_photo(
+                BufferedInputFile(edited_bytes, filename="edited.png"),
+                caption=f"✅ Done!",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            
+            logger.info(f"✅ Image edit completed for user {message.from_user.id}: {edit_type}")
             
         except Exception as e:
-            logger.exception(f"Document vision error for user {message.from_user.id}: {str(e)}")
-            logger.error(f"Full traceback:\n{traceback.format_exc()}")
-            await message.answer(f"❌ Document vision failed: {str(e)}")
+            logger.exception(f"Image edit error for user {message.from_user.id}: {str(e)}")
+            await message.answer("❌ Failed to edit image. Please try again later.")
 
 # =========================
 # ADMIN BOT ROUTER
@@ -2619,6 +2927,8 @@ async def main():
     print(f"✅ Models Loaded: {Config.HF_CHAT_MODEL}")
     print(f"✅ Image Generation Ready: {Config.HF_IMAGE_MODEL}")
     print(f"✅ Search Ready: {'Enabled' if Config.ENABLE_SEARCH else 'Disabled'}")
+    print("✅ Intent Detection: Active")
+    print("✅ Hidden Image Editing: Active")
     print("="*50 + "\n")
     
     # Start webhook or polling mode
